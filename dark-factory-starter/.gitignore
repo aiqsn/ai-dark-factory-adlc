@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.stryker-tmp/
+reports/
+.aider*
+.dev.vars
+.holdout/

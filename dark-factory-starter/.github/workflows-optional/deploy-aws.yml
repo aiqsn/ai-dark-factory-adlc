@@ -1,0 +1,87 @@
+# Optional: deploy to AWS Lambda instead of Cloudflare. To use it, move this file into
+# .github/workflows/ and delete deploy.yml. See README "Deploying to AWS Lambda".
+# Signs in with GitHub OIDC, so no AWS keys are stored. Off until DEPLOY_ENABLED=true.
+name: deploy-aws
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write          # lets the job sign in to AWS with OIDC
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    env:
+      FN: ${{ vars.LAMBDA_FUNCTION }}
+      APP_URL: ${{ vars.APP_URL }}               # function URL of the "live" alias
+      CANDIDATE_URL: ${{ vars.CANDIDATE_URL }}   # function URL of the "candidate" alias
+      PROBE_KEY: ${{ secrets.PROBE_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Build and test
+        run: |
+          make install && make test
+          make package SHA="$SHA"                   # dist/function.zip, with VERSION for /version
+
+      - name: Publish a new version (no traffic yet)
+        run: |
+          echo "STABLE=$(aws lambda get-alias --function-name "$FN" --name live --query FunctionVersion --output text)" >> "$GITHUB_ENV"
+          aws lambda update-function-code --function-name "$FN" --zip-file fileb://dist/function.zip > /dev/null
+          aws lambda wait function-updated --function-name "$FN"
+          NEW=$(aws lambda publish-version --function-name "$FN" --description "$SHA" --query Version --output text)
+          echo "NEW=$NEW" >> "$GITHUB_ENV"
+          aws lambda update-alias --function-name "$FN" --name candidate --function-version "$NEW" > /dev/null
+
+      - name: Probe the new version before it takes traffic
+        run: bash .github/factory/smoke.sh "$CANDIDATE_URL" "$SHA"
+
+      - name: Canary at 10%
+        run: |
+          aws lambda update-alias --function-name "$FN" --name live --function-version "$STABLE" \
+            --routing-config "{\"AdditionalVersionWeights\":{\"$NEW\":0.1}}" > /dev/null
+
+      - name: Watch the canary for 3 minutes
+        run: |
+          for _ in 1 2 3; do bash .github/factory/smoke.sh "$APP_URL" || exit 1; sleep 60; done
+
+      - name: Promote to 100%
+        run: |
+          aws lambda update-alias --function-name "$FN" --name live --function-version "$NEW" \
+            --routing-config '{"AdditionalVersionWeights":{}}' > /dev/null
+
+      - name: Probe production
+        run: bash .github/factory/smoke.sh "$APP_URL" "$SHA"
+
+      - name: Roll back and alert
+        if: failure() && env.STABLE != ''
+        run: |
+          aws lambda update-alias --function-name "$FN" --name live --function-version "$STABLE" \
+            --routing-config '{"AdditionalVersionWeights":{}}'
+          gh issue create --title "Deploy rolled back: ${SHA:0:7}" --label factory-alert,escaped-bug \
+            --assignee "${{ vars.ALERT_ASSIGNEE || github.repository_owner }}" \
+            --body "Probes failed for $SHA, so live went back to version $STABLE. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
