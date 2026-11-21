@@ -1,0 +1,10 @@
+// Cloudflare Workers config. `preview_urls` gives every uploaded version its own URL,
+// which the deploy workflow probes before the version takes any traffic.
+{
+  "name": "dark-factory-starter",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": true }
+}

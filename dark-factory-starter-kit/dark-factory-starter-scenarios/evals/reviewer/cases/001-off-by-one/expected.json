@@ -1,0 +1,1 @@
+{"defect": true, "kind": "off-by-one", "note": "slice(0, 6) returns 6 results, and the test asserts <= 6 instead of <= 5"}

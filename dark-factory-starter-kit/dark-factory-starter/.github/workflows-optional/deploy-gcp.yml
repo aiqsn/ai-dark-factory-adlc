@@ -1,0 +1,93 @@
+# Optional: deploy to Google Cloud Run instead of Cloudflare. To use it, move this file into
+# .github/workflows/ and delete deploy.yml. See README "Other deployment targets".
+# Signs in with Workload Identity Federation, so no Google keys are stored. Off until DEPLOY_ENABLED=true.
+name: deploy-gcp
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write          # lets the job sign in to Google Cloud with OIDC
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    env:
+      SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+      REGION: ${{ vars.GCP_REGION }}
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/${{ vars.GCP_REPOSITORY }}/app:${{ github.sha }}
+      APP_URL: ${{ vars.APP_URL }}               # the service's main URL
+      PROBE_KEY: ${{ secrets.PROBE_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Unit tests
+        run: make install && make test
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push the image
+        run: |
+          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy a new revision with no traffic
+        run: |
+          traffic() { gcloud run services describe "$SERVICE" --region "$REGION" --format=json | jq -r "$1"; }
+          echo "STABLE=$(traffic '[.status.traffic[] | select(.percent == 100)][0].revisionName')" >> "$GITHUB_ENV"
+          gcloud run deploy "$SERVICE" --image "$IMAGE" --region "$REGION" \
+            --no-traffic --tag candidate --set-env-vars "GIT_SHA=$SHA" --quiet
+          echo "NEW=$(traffic '.status.traffic[] | select(.tag == "candidate") | .revisionName')" >> "$GITHUB_ENV"
+          echo "CANDIDATE_URL=$(traffic '.status.traffic[] | select(.tag == "candidate") | .url')" >> "$GITHUB_ENV"
+
+      - name: Probe the new revision before it takes traffic
+        run: bash .github/factory/smoke.sh "$CANDIDATE_URL" "$SHA"
+
+      - name: Canary at 10%
+        run: gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-tags candidate=10 --quiet
+
+      - name: Watch the canary for 3 minutes
+        run: |
+          for _ in 1 2 3; do
+            bash .github/factory/smoke.sh "$APP_URL" || exit 1          # either revision may answer
+            bash .github/factory/smoke.sh "$CANDIDATE_URL" "$SHA" || exit 1
+            sleep 60
+          done
+
+      - name: Promote to 100%
+        run: gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$NEW=100" --quiet
+
+      - name: Probe production
+        run: bash .github/factory/smoke.sh "$APP_URL" "$SHA"
+
+      - name: Roll back and alert
+        if: failure() && env.STABLE != '' && env.STABLE != 'null'
+        run: |
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$STABLE=100" --quiet
+          gh issue create --title "Deploy rolled back: ${SHA:0:7}" --label factory-alert,escaped-bug \
+            --assignee "${{ vars.ALERT_ASSIGNEE || github.repository_owner }}" \
+            --body "Probes failed for $SHA, so Cloud Run went back to revision $STABLE. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
