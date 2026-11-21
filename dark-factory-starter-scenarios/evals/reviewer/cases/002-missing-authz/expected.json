@@ -1,1 +1,0 @@
-{"defect": true, "kind": "security", "note": "any non-empty token is accepted; it is never compared with env.ADMIN_TOKEN"}

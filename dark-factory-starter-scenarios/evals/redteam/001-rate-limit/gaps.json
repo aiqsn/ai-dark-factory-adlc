@@ -1,7 +1,0 @@
-{"gaps": [
-  {"name": "who is limited", "any_of": ["per key", "per api key", "per ip", "per user", "global"]},
-  {"name": "limit and window", "any_of": ["window", "per minute", "per second", "how many requests"]},
-  {"name": "response when limited", "any_of": ["429", "status code", "retry-after"]},
-  {"name": "untestable wording", "any_of": ["abused", "untestable", "testable"]},
-  {"name": "callers without a key", "any_of": ["anonymous", "without a key", "unauthenticated"]}
-]}

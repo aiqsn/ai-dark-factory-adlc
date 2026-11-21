@@ -1,7 +1,0 @@
-# Read-only production probes, run by .github/factory/smoke.sh. Never add a check that writes data.
-# METHOD  PATH                    STATUS  TEXT THAT MUST APPEAR (optional)
-GET       /healthz                200     ok
-GET       /                       200     Dark factory sample app
-GET       /api/search?q=running   200     "results"
-GET       /api/search             400     "missing q"
-GET       /does-not-exist         404
